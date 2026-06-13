@@ -1,7 +1,8 @@
 
 
 This is an official implementation of [AWEMixer: Adaptive Wavelet-Enhanced Mixer Network for Long-Term Time Series Forecasting].
-<img width="1321" height="624" alt="image" src="https://github.com/user-attachments/assets/455367fe-64ba-476f-8218-bc7930d41311" />
+<img width="1430" height="755" alt="image" src="https://github.com/user-attachments/assets/c0ffb963-c728-4b53-9d8e-a7f16e3ec0f8" />
+
 
 
 ### Prerequisites
