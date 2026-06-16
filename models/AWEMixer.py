@@ -2,12 +2,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-import pywt # 恢复使用原始的小波变换库
+import pywt 
 
 # =====================================================================================
-# 1. 核心模块 (RevIN, MixerBlock CoherentGatingBlock)
+# 1. 基础模块：RevIN (保持不变)
 # =====================================================================================
-
 class RevIN(nn.Module):
     def __init__(self, num_features: int, eps=1e-5, affine=True):
         super(RevIN, self).__init__()
@@ -20,240 +19,303 @@ class RevIN(nn.Module):
 
     def forward(self, x, mode: str):
         if mode == 'norm':
-            self._get_statistics(x)
-            x = self._normalize(x)
+            self.mean = torch.mean(x, dim=1, keepdim=True).detach()
+            self.stdev = torch.sqrt(torch.var(x, dim=1, keepdim=True, unbiased=False) + self.eps).detach()
+            x = (x - self.mean) / self.stdev
+            if self.affine: x = x * self.affine_weight + self.affine_bias
         elif mode == 'denorm':
-            x = self._denormalize(x)
-        else:
-            raise NotImplementedError
+            if self.affine: x = (x - self.affine_bias) / (self.affine_weight + 1e-10)
+            x = x * self.stdev + self.mean
         return x
 
-    def _get_statistics(self, x):
-        self.mean = torch.mean(x, dim=1, keepdim=True).detach()
-        self.stdev = torch.sqrt(torch.var(x, dim=1, keepdim=True, unbiased=False) + self.eps).detach()
+# =====================================================================================
+# 2. Multi-Scale Temporal Representation (多尺度时域表示)
+# 严格对齐 Eq 5-7: k_s = 2s+1, same padding (Reflection), 不改变序列长度
+# =====================================================================================
+class MultiScaleTemporalRepresentation(nn.Module):
+    def __init__(self, num_scales, d_model):
+        super().__init__()
+        self.embedders = nn.ModuleList()
+        # s 属于 1, ..., S
+        for s in range(1, num_scales + 1):
+            kernel_size = 2 * s + 1
+            padding = kernel_size // 2  # Eq 5: p_s = d_s * (k_s - 1) / 2
+            
+            self.embedders.append(nn.Sequential(
+                nn.ReflectionPad1d(padding), # 使用反射填充减少边界伪影
+                nn.Conv1d(1, 16, kernel_size=kernel_size, stride=1),
+                nn.GELU(),
+                nn.AdaptiveAvgPool1d(1), # 自适应平均池化得到全局 Anchor
+                nn.Flatten(),
+                nn.Linear(16, d_model)
+            ))
 
-    def _normalize(self, x):
-        x = x - self.mean
-        x = x / self.stdev
-        if self.affine:
-            x = x * self.affine_weight + self.affine_bias
-        return x
+    def forward(self, x_ci):
+        x_in = x_ci.unsqueeze(1) 
+        # 返回形状 (B*C, S, D)
+        return torch.stack([emb(x_in) for emb in self.embedders], dim=1) 
 
-    def _denormalize(self, x):
-        if self.affine:
-            x = (x - self.affine_bias) / (self.affine_weight + 1e-10) # 增加稳定性
-        x = x * self.stdev + self.mean
-        return x
-
-class CoherentGatingBlock(nn.Module):
-    """相干门控融合块 (与原版基本一致)"""
-    def __init__(self, d_model, n_heads, dropout):
-        super(CoherentGatingBlock, self).__init__()
-        self.context_attention = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
-        # 优化门控，使其更具表达能力
-        self.gate = nn.Sequential(nn.Linear(2 * d_model, d_model), nn.GELU(), nn.Linear(d_model, d_model), nn.Sigmoid())
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-
-    def forward(self, h_t, h_w_pyramid):
-        # h_t: (B*C, 1, D), h_w_pyramid: (B*C, Num_Bands, D)
-        # 1. h_t 查询整个小波金字塔，合成上下文
-        context, _ = self.context_attention(query=h_t, key=h_w_pyramid, value=h_w_pyramid)
-        h_t_enhanced = self.norm1(h_t + context)
+# =====================================================================================
+# 3. Multi-Band Wavelet Representation (多频段小波表示)
+# 严格对齐 Eq 9-11: 使用 Undecimated 小波滤波 (空洞卷积实现)，不插值
+# =====================================================================================
+class MultiBandWaveletRepresentation(nn.Module):
+    def __init__(self, wavelet_name='db4', level=3):
+        super().__init__()
+        self.level = level
+        wavelet = pywt.Wavelet(wavelet_name)
         
-        # 2. 门控融合
-        # 使用 unsqueeze 保持维度一致性，避免 squeeze-unsqueeze
-        g = self.gate(torch.cat([h_t, h_t_enhanced], dim=-1))
+        # 提取低通和高通滤波器
+        h0 = np.array(wavelet.dec_lo[::-1], dtype=np.float32) / np.sqrt(2)
+        h1 = np.array(wavelet.dec_hi[::-1], dtype=np.float32) / np.sqrt(2)
+        filters = np.stack([h0, h1], axis=0)
         
-        h_t_fused = g * h_t_enhanced + (1 - g) * h_t
-        return self.norm2(h_t_fused)
+        self.register_buffer('filters', torch.tensor(filters).unsqueeze(1))
+        self.filter_length = len(h0)
 
-class MixerBlock(nn.Module):
-    """跨尺度混合器"""
-    def __init__(self, num_scales, d_model, tokens_mlp_dim, dropout=0.1):
+    def forward(self, x):
+        x = x.unsqueeze(1).contiguous() 
+        coeffs = []
+        v_j = x
+
+        for j in range(self.level):
+            dilation = 2 ** j
+            pad_size = (self.filter_length - 1) * dilation
+            # 使用 circular 边界处理以规避时序变长，保持 L 不变
+            v_j_padded = F.pad(v_j, (pad_size, 0), mode='circular') 
+
+            res = F.conv1d(v_j_padded, self.filters, dilation=dilation)
+            v_j, w_j = res[:, 0:1, :], res[:, 1:2, :]
+            coeffs.append(w_j.squeeze(1)) 
+
+        coeffs.append(v_j.squeeze(1)) 
+        # 返回列表: [V_J, W_J, W_{J-1}, ..., W_1]
+        return coeffs[::-1] 
+
+# =====================================================================================
+# 4. Frequency Router (频段路由器)
+# 严格对齐 Eq 15-27: 严格的FFT频段划分，步长为1的局部突发能量窗口，以及跨子带特征归一化
+# =====================================================================================
+class FrequencyRouter(nn.Module):
+    def __init__(self, num_bands):
+        super().__init__()
+        self.num_bands = num_bands
+        self.router_mlp = nn.Sequential(
+            nn.Linear(4 * num_bands, 64),
+            nn.GELU(),
+            nn.Linear(64, num_bands)
+        )
+
+    def forward(self, x_ci, w_coeffs_stack):
+        B_C, Nb, L = w_coeffs_stack.shape
+
+        # -------------------------------------------------------------
+        # Descriptor 1: FFT Spectral Statistics (Eq 15-17)
+        # -------------------------------------------------------------
+        amp = torch.abs(torch.fft.rfft(x_ci, dim=-1)) # Shape: (B*C, K_fft + 1)
+        K_fft = L // 2
+        
+        e_fft = torch.zeros(B_C, Nb, device=x_ci.device)
+        total_amp_energy = torch.sum(amp ** 2, dim=-1) + 1e-8
+        
+        for j in range(1, Nb + 1):
+            # 严格依据 Eq 16 进行频点粗略分配
+            start_k = int((j - 1) * (K_fft + 1) / Nb)
+            end_k = int(j * (K_fft + 1) / Nb)
+            if j == Nb: end_k = K_fft + 1
+            
+            region_amp = amp[:, start_k:end_k]
+            e_fft[:, j-1] = torch.sum(region_amp ** 2, dim=-1) / total_amp_energy
+
+        # -------------------------------------------------------------
+        # Descriptor 2: Global Wavelet Energy (Eq 18)
+        # -------------------------------------------------------------
+        e_wavelet = torch.mean(w_coeffs_stack ** 2, dim=-1) # (B*C, Nb)
+
+        # -------------------------------------------------------------
+        # Descriptor 3: Local Burst Energy (Eq 19-20)
+        # -------------------------------------------------------------
+        L_loc = 16 if L >= 16 else L
+        # 滑动窗口 (stride=1) 计算局部能量
+        # 相当于用大小为 L_loc 的 AvgPool 计算序列均方值
+        q_j = F.avg_pool1d(w_coeffs_stack ** 2, kernel_size=L_loc, stride=1) 
+        # 取最大的局部能量值 (max over valid windows)
+        e_local, _ = q_j.max(dim=-1) # (B*C, Nb)
+
+        # -------------------------------------------------------------
+        # Descriptor 4: Band-wise Entropy (Eq 21-22)
+        # -------------------------------------------------------------
+        energy_t = w_coeffs_stack ** 2
+        sum_energy = torch.sum(energy_t, dim=-1, keepdim=True) + 1e-8
+        p = energy_t / sum_energy 
+        # Eq 22: e_ent = - (1 / log(L)) * \sum( p_j * log(p_j + eps) )
+        e_entropy = - (1.0 / np.log(L)) * torch.sum(p * torch.log(p + 1e-8), dim=-1) # (B*C, Nb)
+
+        # -------------------------------------------------------------
+        # Eq 24: Z-score Normalization Across Subbands (非常关键)
+        # -------------------------------------------------------------
+        def normalize_across_bands(e):
+            mu = e.mean(dim=1, keepdim=True)
+            sigma = e.std(dim=1, keepdim=True, unbiased=False) + 1e-8
+            return (e - mu) / sigma
+
+        e_fft_norm = normalize_across_bands(e_fft)
+        e_wavelet_norm = normalize_across_bands(e_wavelet)
+        e_local_norm = normalize_across_bands(e_local)
+        e_entropy_norm = normalize_across_bands(e_entropy)
+
+        # -------------------------------------------------------------
+        # Eq 25-26: Concatenate and Route
+        # -------------------------------------------------------------
+        router_input = torch.cat([e_fft_norm, e_wavelet_norm, e_local_norm, e_entropy_norm], dim=-1) 
+        alpha = F.softmax(self.router_mlp(router_input), dim=-1) 
+        
+        return alpha.unsqueeze(-1) # (B*C, N_b, 1)
+
+# =====================================================================================
+# 5. Coherent Gated Fusion Block (相干门控融合块)
+# 严格对齐 Eq 28-30
+# =====================================================================================
+class LightweightSingleHeadAttention(nn.Module):
+    """用于表示特征间交互的极轻量级单头交叉注意力机制"""
+    def __init__(self, d_model, dropout=0.1):
+        super().__init__()
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+        self.scale = d_model ** -0.5
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, q, k, v):
+        Q, K, V = self.q_proj(q), self.k_proj(k), self.v_proj(v)
+        attn_scores = torch.matmul(Q, K.transpose(-1, -2)) * self.scale
+        attn_raw = F.softmax(attn_scores, dim=-1)
+        attn_weights = self.dropout(attn_raw)
+        context = torch.matmul(attn_weights, V)
+        return self.out_proj(context), attn_raw
+
+class CoherentGatedFusionBlock(nn.Module):
+    def __init__(self, d_model, dropout):
+        super().__init__()
+        self.cross_attn = LightweightSingleHeadAttention(d_model, dropout=dropout)
+        self.gate = nn.Sequential(
+            nn.Linear(2 * d_model, d_model),
+            nn.Sigmoid() # 严格对齐 Eq 29
+        )
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, Z_t, H_w_weighted):
+        # 交叉注意力获取频率上下文 Cf
+        C_f, attn_weights = self.cross_attn(q=Z_t, k=H_w_weighted, v=H_w_weighted)
+        
+        # 兼容性门控 G 
+        g = self.gate(torch.cat([Z_t, C_f], dim=-1))
+        
+        # 残差注入 Z_tf
+        Z_tf = Z_t + g * C_f
+        return self.norm(Z_tf), g, attn_weights
+
+# =====================================================================================
+# 6. Cross-Scale Mixer Block (跨尺度混合器)
+# 对齐 Eq 31
+# =====================================================================================
+class CrossScaleMixerBlock(nn.Module):
+    def __init__(self, num_scales, d_model, dropout=0.1):
         super().__init__()
         self.norm = nn.LayerNorm(d_model)
-        self.token_mixing = nn.Sequential(
-            nn.Linear(num_scales, tokens_mlp_dim), nn.GELU(),
-            nn.Dropout(dropout), # 增加Dropout
-            nn.Linear(tokens_mlp_dim, num_scales)
+        self.mixer = nn.Sequential(
+            nn.Linear(num_scales, num_scales * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(num_scales * 2, num_scales)
         )
 
     def forward(self, x):
-        # x: (B*C, S, D)
         residual = x
-        x = self.norm(x).transpose(1, 2) # (B*C, D, S)
-        x = self.token_mixing(x).transpose(1, 2) # (B*C, S, D)
+        x = self.norm(x).transpose(1, 2)
+        x = self.mixer(x).transpose(1, 2)
         return residual + x
 
-# +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
-# 2.  频段路由器 
-# +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
-class FrequencyRouter(nn.Module):
-    """
-    频段路由器: 根据输入信号的周期性特征，动态为每个小波频段生成权重。
-    借鉴Pathformer的思想，但应用于频域。
-    """
-    def __init__(self, seq_len, num_wavelet_bands, top_k=4, d_model=128):
-        super().__init__()
-        self.top_k = top_k
-        self.seq_len = seq_len
-        self.num_wavelet_bands = num_wavelet_bands
-
-        # 用于提取周期性特征的线性层
-        self.period_extractor = nn.Linear(seq_len // 2 + 1, d_model)
-        # 生成路由权重的最终线性层
-        self.router_generator = nn.Linear(d_model, num_wavelet_bands)
-
-    def forward(self, x_ci):
-        # x_ci: (B*C, L_in)
-        # 1. 使用FFT提取信号的周期性特征
-        fft_result = torch.fft.rfft(x_ci, n=self.seq_len, dim=-1)
-        # 取振幅作为特征，形状为 (B*C, L_in//2 + 1)
-        amplitude = torch.abs(fft_result)
-
-        # 2. 从周期性特征生成路由权重
-        period_features = self.period_extractor(amplitude) # (B*C, d_model)
-        period_features = F.gelu(period_features)
-        
-        # 形状为 (B*C, num_wavelet_bands)
-        routing_weights = self.router_generator(period_features) 
-
-        # 3. 使用Softmax归一化权重，使其成为概率分布
-        # 增加一个维度以用于后续的广播乘法: (B*C, num_wavelet_bands, 1)
-        routing_weights = F.softmax(routing_weights, dim=-1).unsqueeze(-1)
-        
-        return routing_weights
-
 # =====================================================================================
-# 3. 主模型 
+# 7. AWEMixer 完整主模型 (完全对齐 Figure 2)
 # =====================================================================================
 class Model(nn.Module):
     def __init__(self, configs):
         super(Model, self).__init__()
-        # --- 基础模型架构参数 ---
-        # 建议将这些参数作为configs的一部分传入，这里为了演示方便直接定义
-        configs.d_model = getattr(configs, 'd_model', 128)
-        configs.n_heads = getattr(configs, 'n_heads', 8)
-        configs.d_ff = getattr(configs, 'd_ff', 256)
-        configs.dropout = getattr(configs, 'dropout', 0.1)
-        configs.num_encoder_layers = getattr(configs, 'num_encoder_layers', 3)
-
-        # --- CoWa-Mixer 特定创新参数 ---
-        configs.num_scales = getattr(configs, 'num_scales', 3)
-        configs.wavelet = getattr(configs, 'wavelet', 'db4')
-        configs.wavelet_level = getattr(configs, 'wavelet_level', 3)
-        configs.tokens_mlp_dim = getattr(configs, 'tokens_mlp_dim', 64)
-
-        # --- 其他 ---
-        configs.revin = getattr(configs, 'revin', True)
-        self.configs = configs
-        self.revin_layer = RevIN(configs.enc_in, affine=True) if configs.revin else None
-
-        # --- 小波变换参数 ---
-        self.wavelet = configs.wavelet
-        self.wavelet_level = configs.wavelet_level
-        self.num_wavelet_bands = self.wavelet_level + 1
-
-        # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
-        # 优化点: 实例化频段路由器
-        # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
-        self.frequency_router = FrequencyRouter(
-            seq_len=configs.seq_len,
-            num_wavelet_bands=self.num_wavelet_bands,
-            d_model=configs.d_model
+        self.seq_len = configs.seq_len
+        self.pred_len = configs.pred_len
+        self.d_model = getattr(configs, 'd_model', 128)
+        self.num_scales = getattr(configs, 'num_scales', 3)
+        self.wavelet_level = getattr(configs, 'wavelet_level', 3)
+        self.num_bands = self.wavelet_level + 1
+        self.num_fusion_layers = getattr(configs, 'num_encoder_layers', 1) 
+        
+        self.revin_layer = RevIN(configs.enc_in) if getattr(configs, 'revin', True) else None
+        
+        # (a) Temporal Branch
+        self.temporal_representation = MultiScaleTemporalRepresentation(self.num_scales, self.d_model)
+        
+        # (b) Wavelet Branch
+        self.wavelet_representation = MultiBandWaveletRepresentation(
+            wavelet_name=getattr(configs, 'wavelet', 'db4'), 
+            level=self.wavelet_level
         )
-
-        # --- 金字塔构建与嵌入 ---
-        self.temporal_embedders = nn.ModuleList()
-        for i in range(configs.num_scales):
-            # 动态计算输入长度，避免硬编码
-            input_len = (configs.seq_len + 2**i - 1) // (2**i) if i > 0 else configs.seq_len
-            self.temporal_embedders.append(nn.Linear(input_len, configs.d_model))
-
-        # 小波频带嵌入层 (每个频带一个)
-        self.wavelet_embedders = nn.ModuleList(
-            [nn.Linear(configs.seq_len, configs.d_model) for _ in range(self.num_wavelet_bands)]
-        )
-
-        # --- 相干门控融合主干 ---
-        self.gating_backbone = nn.ModuleList([
-            CoherentGatingBlock(configs.d_model, configs.n_heads, configs.dropout)
-            for _ in range(configs.num_encoder_layers)
+        self.band_embedders = nn.ModuleList([
+            nn.Linear(self.seq_len, self.d_model) for _ in range(self.num_bands)
         ])
+        
+        # (c) Router
+        self.frequency_router = FrequencyRouter(self.num_bands)
+        
+        # (d) Fusion Block
+        self.gating_backbone = nn.ModuleList([
+            CoherentGatedFusionBlock(self.d_model, getattr(configs, 'dropout', 0.1))
+            for _ in range(self.num_fusion_layers)
+        ])
+        
+        # (e) Cross-scale & Pred
+        self.cross_scale_mixer = CrossScaleMixerBlock(self.num_scales, self.d_model)
+        
+        # Eq 33 预测头
+        self.prediction_head = nn.Linear(self.d_model, self.pred_len)
 
-        # --- 跨尺度混合器 ---
-        self.inter_scale_mixer = MixerBlock(configs.num_scales, configs.d_model, configs.tokens_mlp_dim, configs.dropout)
-
-        # --- 预测头 ---
-        self.prediction_head = nn.Sequential(
-            nn.Linear(configs.d_model, configs.d_ff),
-            nn.GELU(), nn.Dropout(configs.dropout),
-            nn.Linear(configs.d_ff, configs.pred_len)
-        )
-
-    def forward(self, x_enc, x_mark_enc=None, x_dec=None, x_mark_dec=None, mask=None):
+    def forward(self, x_enc, x_mark_enc=None, x_dec=None, x_mark_dec=None, mask=None, return_aux=False):
         B, L_in, C = x_enc.shape
         if self.revin_layer: x_enc = self.revin_layer(x_enc, 'norm')
-        # permute and reshape for channel independence
         x_ci = x_enc.permute(0, 2, 1).reshape(B * C, L_in)
-
-        # --- 1. 构建时域金字塔 (Temporal Pyramid) ---
-        temporal_pyramid = []
-        for i in range(self.configs.num_scales):
-            if i == 0:
-                t_s = x_ci
-            else:
-                # 使用padding确保即使在奇数长度下也能正常工作
-                t_s = F.avg_pool1d(x_ci.unsqueeze(1), kernel_size=2**i, stride=2**i, padding=0).squeeze(1)
-            temporal_pyramid.append(self.temporal_embedders[i](t_s))
         
-        # --- 2. 构建小波金字塔 (Wavelet Pyramid) ---
-        with torch.no_grad(): # 小波变换本身不可导，在no_grad下执行
-            coeffs = pywt.wavedec(x_ci.cpu().numpy(), self.wavelet, level=self.wavelet_level)
+        # 1. 提取时间锚点特征 -> Eq 5-8
+        Z_t = self.temporal_representation(x_ci) 
         
-        wavelet_bands_embedded = []
-        for i, band_coeffs_np in enumerate(coeffs):
-            band_coeffs = torch.from_numpy(band_coeffs_np).float().to(x_enc.device)
-            aligned_coeffs = F.interpolate(
-                band_coeffs.unsqueeze(1), size=L_in, mode='linear', align_corners=False
-            ).squeeze(1)
-            embedded_band = self.wavelet_embedders[i](aligned_coeffs)
-            wavelet_bands_embedded.append(embedded_band)
+        # 2. 提取并映射小波子带特征 -> Eq 9-14
+        wav_coeffs = self.wavelet_representation(x_ci)   
+        w_coeffs_stack = torch.stack(wav_coeffs, dim=1) 
+        H_w = torch.stack([self.band_embedders[i](wav_coeffs[i]) for i in range(self.num_bands)], dim=1) 
         
-        # h_w_pyramid: (B*C, num_wavelet_bands, D)
-        h_w_pyramid = torch.stack(wavelet_bands_embedded, dim=1)
-
-        # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
-        # 优化点: 使用频段路由器生成权重，并对小波金字塔进行加权
-        # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
-        # 1. 获取路由权重，形状为 (B*C, num_wavelet_bands, 1)
-        routing_weights = self.frequency_router(x_ci)
+        # 3. 自适应频率加权 -> Eq 26-27
+        alpha = self.frequency_router(x_ci, w_coeffs_stack) 
+        H_w_weighted = H_w * alpha
         
-        # 2. 对小波金字塔进行加权
-        # (B*C, num_wavelet_bands, D) * (B*C, num_wavelet_bands, 1) -> (B*C, num_wavelet_bands, D)
-        # 广播机制会自动处理最后一个维度
-        h_w_pyramid_weighted = h_w_pyramid * routing_weights
-
-        # --- 3. 相干门控融合 (Coherent Gating Fusion) ---
-        h_t_pyramid = [t.unsqueeze(1) for t in temporal_pyramid] # List of (B*C, 1, D)
-        
-        # 时域金字塔的每个尺度都会查询加权后的、更具动态性的频域金字塔
+        # 4. 相干门控注入 -> Eq 28-30
+        Z_tf = Z_t
+        gates, attns = [], []
         for block in self.gating_backbone:
-            h_t_pyramid = [block(h_t, h_w_pyramid_weighted) for h_t in h_t_pyramid]
-
-        # --- 4. 跨尺度混合 (Cross-Scale Mixing) ---
-        h_t_final = [h.squeeze(1) for h in h_t_pyramid]
-        stacked_for_mixer = torch.stack(h_t_final, dim=1) # (B*C, S, D)
-        mixed_features = self.inter_scale_mixer(stacked_for_mixer)
-
-        # --- 5. 聚合与预测 (Aggregation & Prediction) ---
-        final_repr = mixed_features.mean(dim=1) # (B*C, D)
-        prediction = self.prediction_head(final_repr)
+            Z_tf, g, attn = block(Z_tf, H_w_weighted)
+            if return_aux:
+                gates.append(g), attns.append(attn)
+            
+        # 5. 跨尺度混合与均值池化 -> Eq 31-32
+        Z_mix = self.cross_scale_mixer(Z_tf) 
+        Z_final = Z_mix.mean(dim=1) 
         
-        # --- 6. 恢复形状与反归一化 ---
-        prediction = prediction.reshape(B, C, self.configs.pred_len).permute(0, 2, 1)
-        if self.revin_layer:
-            prediction = self.revin_layer(prediction, 'denorm')
+        # 6. 预测头与反归一化 -> Eq 33
+        Y_hat = self.prediction_head(Z_final)
         
-        return prediction
+        Y_hat = Y_hat.reshape(B, C, self.pred_len).permute(0, 2, 1)
+        if self.revin_layer: Y_hat = self.revin_layer(Y_hat, 'denorm')
+        
+        if return_aux:
+            return Y_hat, {"alpha": alpha, "gates": gates, "attentions": attns, "wavelet_coeffs": w_coeffs_stack}
+            
+        return Y_hat
